@@ -1,9 +1,10 @@
 import serial
-import threading
 import time
 import binascii
 import ctypes
+from ctypes import *
 kernel32 = ctypes.windll.kernel32
+import miug3_file_write
 
 
 UDS_PING_CMD = bytearray([0x81, 0x10, 0xF1, 0x81, 0x03])
@@ -14,7 +15,7 @@ UDS_REQ_KEY_CMD = bytearray([0x80, 0x10, 0x01, 0x02, 0x27, 0x09, 0xC3])
 UDS_RESP_KEY_CMD = bytearray([0x80, 0x10, 0x01, 0x06, 0x27, 0x0A])
 UDS_REQ_READ_EEPROM_CMD = bytearray([0x80, 0x10, 0x01, 0x02, 0x35, 0x22, 0xEA])
 UDS_READ_EEPROM_CMD = bytearray([0x80, 0x10, 0x01, 0x06, 0x36, 0x22])
-
+UDS_ECU_RESET_CMD = bytearray([0x82, 0x10, 0xF1, 0x11, 0x01, 0x95])
 
 ser = serial.Serial('COM6', 10400, timeout=2)
 seedkey_pass = False
@@ -1373,22 +1374,16 @@ def seedKey_response_READ(seed0, seed1):
 
     return bytearray([key0, key1])
 
-def seedKey_response_Write(seed4Bytes):
-    print("seedKey_response_Write")
-    # data_print(seed4Bytes)
-    hex_string = binascii.hexlify(seed4Bytes).decode('utf-8')  # Convert bytes to hexadecimal string
-    formatted_string = ' '.join([hex_string[i:i+2] for i in range(0, len(hex_string), 2)])  # Add space every two characters
-    formatted_string = formatted_string.upper()
-    
-    try:
-        key4byte = seed_key_dict[formatted_string]
-    except KeyError as e:
-        key4byte = "00 00 00 00"
-    print(key4byte)
-    
-    byte_array = bytes.fromhex(key4byte.replace(" ", ""))
 
-    return byte_array
+def seedKey_response_Write(seed4Bytes):
+    print("seedKey_response_Write: ")
+    # data_print(seed4Bytes)
+
+
+    my_functions = CDLL(".\seedkey.so")
+    ret = my_functions.caculate_seedKey(seed4Bytes[0] << 8 | seed4Bytes[1], seed4Bytes[2] << 8 | seed4Bytes[3])
+    # data_print(byte_arrays)
+    return ret
 
 ################## END LOCAL FUNCTION ##################
 
@@ -1416,13 +1411,25 @@ def UDS_trans_cmd(data, isheader4 = False, baudrate = 10400, timeout = 1):
     data_print(data)
     print("recv ")
     data_print(reads)
-    print("-----------------------")
+
+    # Clear input buffer
+    ser.flushInput()
+    # Clear output buffer
+    ser.flushOutput()
 
     #small delay
     time.sleep(0.1)
     # ser.reset_output_buffer()
     return reads
 
+
+def UDS_ECU_reset():
+    byte_recv = UDS_trans_cmd(UDS_ECU_RESET_CMD, isheader4=False, baudrate=38400)
+
+    if bytearray([0x83, 0xF1, 0x10, 0x7F, 0x11, 0x11, 0x25]) in byte_recv:
+        print("ECU reset success")
+    else:
+        print("ECU reset fail")
 
 def UDS_bypass_sercurity_READ_READ():
     print("Seed - Key process")
@@ -1442,24 +1449,30 @@ def UDS_bypass_sercurity_READ_READ():
         else:
             print("Seed - Key fail :(, try again time",count)
 
+
 def UDS_bypass_sercurity_WRITE():
     print("UDS_bypass_sercurity_WRITE Seed And Key")
     global try_time
     
     byte_recv = UDS_trans_cmd(bytearray([0x82, 0x10, 0xF1, 0x27, 0x01, 0xAB]), baudrate=38400)
-    byte_response = seedKey_response_Write(byte_recv[5:9])
+    byte32_response = seedKey_response_Write(byte_recv[5:9])
+    if byte32_response < 0: 
+        byte32_response = 0 - byte32_response
+    byte_response = byte32_response.to_bytes(4, byteorder='big')  # Assuming a 32-bit value (4 bytes)
+
     cmd = bytearray([0x86, 0x10, 0xF1, 0x27, 0x02])
     cmd.extend(byte_response)
     cmd.extend(data_caculate_crc(cmd))
     byte_recv = UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
 
     if bytearray([0x83, 0xF1, 0x10, 0x67, 0x02, 0x34, 0x21]) in byte_recv:
-        print("Seed - Key success!! so lucky")
+        print("Seed - Key success!!")
         global seedkey_pass
         seedkey_pass = True
     else:
         print("Seed - Key fail :(, try again time",try_time)
         try_time = try_time + 1
+        time.sleep(0.5)
 
 
 def Piaggio_read_eeprom():
@@ -1482,6 +1495,9 @@ def Piaggio_read_eeprom():
 
 
 def Piaggio_write_flash():
+    global seedkey_pass
+    seedkey_pass = False
+
     print("Piaggio_write_flash")
 
     print("Change baud 38400")
@@ -1493,7 +1509,66 @@ def Piaggio_write_flash():
     cmd = bytearray([0x87, 0x10, 0xF1, 0x83, 0x03, 0x32, 0x01, 0xDC, 0x01, 0x00, 0x1E])
     UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
     
-    UDS_bypass_sercurity_WRITE()
+    #SeedKey
+    while(seedkey_pass == False):
+        UDS_bypass_sercurity_WRITE()
+
+    print("Write identifier, Date and Time, service 3B")
+    cmd = bytearray([0x86, 0x10, 0xF1, 0x3B, 0x99, 0x20, 0x24, 0x01, 0x16, 0xB6])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+    cmd = bytearray([0x8C, 0x10, 0xF1, 0x3B, 0x98, 0x57, 0x4C, 0x6F, 0x61, 0x64, 0x31, 0x30, 0x33, 0x39, 0x54, 0x58])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+
+    print("Rountin control, service 31")
+    cmd = bytearray([0x88, 0x10, 0xF1, 0x31, 0x02, 0xC2, 0x00, 0x00, 0xC7, 0xFF, 0xFF, 0x43])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+
+    print("Erase request")
+    cmd = bytearray([0x82, 0x10, 0xF1, 0x33, 0x02, 0xB8])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+    time.sleep(1.1)
+    # Clear input buffer
+    ser.flushInput()
+    # Clear output buffer
+    ser.flushOutput()
+
+    print("Request download")
+    cmd = bytearray([0x88, 0x10, 0xF1, 0x34, 0xC2, 0x00, 0x00, 0x03, 0x06, 0x00, 0x00, 0x88])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+
+    print("################################")
+    file_path = 'test.txt'
+    # Mở file trong chế độ đọc ('r')
+    line_index = 0
+    with open(file_path, 'r') as file:
+        for line in file:
+            # Xử lý từng dòng ở đây
+            # print(line.strip())
+            print("file line ", line_index)
+            line_index = line_index + 1
+            hex_values = line.strip().split()
+            # Convert each hexadecimal value to a byte and create a byte array
+            byte_array = bytearray([int(value, 16) for value in hex_values])
+            UDS_trans_cmd(byte_array, isheader4=False, baudrate=38400)
+    
+    print("End Download file")
+    cmd = bytearray([0x80, 0x10, 0xF1, 0x01, 0x37, 0xB9])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+    #Check sum
+    cmd = bytearray([0x8A, 0x10, 0xF1, 0x31, 0x01, 0xC2, 0x00, 0x00, 0xC7, 0xFF, 0xFF, 0xD4, 0xD5, 0xED])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+    cmd = bytearray([0x82, 0x10, 0xF1, 0x33, 0x01, 0xB7])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+    time.sleep(0.5)
+    # Clear buffer
+    ser.flushInput()
+    ser.flushOutput()
+    cmd = bytearray([0x81, 0x10, 0xF1, 0x20, 0xA2])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+    cmd = bytearray([0x81, 0x10, 0xF1, 0x82, 0x04])
+    UDS_trans_cmd(cmd, isheader4=False, baudrate=38400)
+
+    print("Download success")
 
 
 ################## END PUBLIC FUNCTION ##################
@@ -1514,27 +1589,18 @@ def init():
     print("Read device info")
     UDS_trans_cmd(UDS_READID_CMD, isheader4=False)
 
-
-
 def main():
-    global seedkey_pass
-
-    init()
-
     ################################
     # Piaggio_read_eeprom()
 
-    global seedkey_pass
-    seedkey_pass = False
-    while(seedkey_pass == False):
-        print("The time of code execution is : ", time.ctime())
-        init()
-        Piaggio_write_flash()
-        time.sleep(8)
-    
+    print("The time of code execution is : ", time.ctime())
+    init()
 
-    # seed4byte = bytearray([0x07, 0x64, 0xEC, 0xCC])
-    # seedKey_response_Write(seed4byte)
+    Piaggio_write_flash()
+
+    ################################
+    
+    
 
 if __name__ == "__main__":
     main()
